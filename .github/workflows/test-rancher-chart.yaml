@@ -1,0 +1,150 @@
+name: Test build of the Rancher charts (no staging push)
+
+# Builds neuvector, neuvector-crd and neuvector-monitor for the Rancher catalog with the
+# code of neuvector/neuvector-helm#685 (prepare-charts.sh + .github/rancher-chart), then
+# stamps, checks and packages them with cargueiro, exactly as the ship-family-staged
+# action does, but WITHOUT pushing to stgregistry.suse.com or touching rancher/charts.
+# No Vault access or credentials are needed.
+#
+# Output:
+#   - always: the three .tgz files as a workflow artifact (for `helm install`)
+#   - optional: the charts pushed to ghcr.io/<owner>/neuvector-charts (for the Rancher UI)
+#
+# Run it from the Actions tab, or:
+#   gh workflow run test-rancher-chart.yaml --repo leotseng-suse/neuvector-helm \
+#     -f release-branch=release/v2.11 -f version=111.0.0+up2.11.4-rc.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-branch:
+        description: "Branch of neuvector/neuvector-helm to build the charts from"
+        required: true
+        default: release/v2.11
+      version:
+        description: "Chart version to stamp (1XY.Z.W+upA.B.C, prerelease as -rc.N)"
+        required: true
+        default: 111.0.0+up2.11.4-rc.1
+      rancher-version:
+        description: "Rancher minor the charts are for"
+        required: true
+        default: "2.16"
+      kube-version:
+        description: "Kubernetes range, both bounds"
+        required: true
+        default: ">= 1.34.0-0 < 1.37.0-0"
+      tools-repo:
+        description: "Repository with prepare-charts.sh and .github/rancher-chart"
+        required: true
+        default: nicholasSUSE/neuvector-helm
+      tools-ref:
+        description: "Branch of tools-repo"
+        required: true
+        default: feat/stage-charts-with-cargueiro
+      push-to-ghcr:
+        description: "Also push the charts to ghcr.io/<owner>/neuvector-charts"
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build the test charts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # only used when push-to-ghcr is true
+    env:
+      VERSION: ${{ inputs.version }}
+      RANCHER_VERSION: ${{ inputs.rancher-version }}
+      KUBE_VERSION: ${{ inputs.kube-version }}
+      PUSH_TO_GHCR: ${{ inputs.push-to-ghcr }}
+    steps:
+      - name: Checkout the chart tooling (PR #685)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.tools-repo }}
+          ref: ${{ inputs.tools-ref }}
+          path: tools
+          persist-credentials: false
+
+      - name: Checkout the release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: neuvector/neuvector-helm
+          ref: ${{ inputs.release-branch }}
+          path: release
+          persist-credentials: false
+
+      - name: Install cargueiro
+        run: |
+          curl -fsSL https://github.com/rancher/cargueiro/releases/latest/download/install.sh | sh -
+          cargueiro version
+          yq --version
+          helm version --short
+
+      - name: Prepare the charts
+        run: tools/.github/workflows/scripts/prepare-charts.sh release "$RUNNER_TEMP/charts"
+
+      - name: Stamp, check and package (same commands as ship-family-staged)
+        run: |
+          set -euo pipefail
+          dirs=("$RUNNER_TEMP/charts/neuvector" "$RUNNER_TEMP/charts/neuvector-crd" "$RUNNER_TEMP/charts/neuvector-monitor")
+
+          echo "::group::cargueiro stamp (dry run)"
+          cargueiro stamp --family neuvector "${dirs[@]}" --version "$VERSION" --dry-run --debug
+          echo "::endgroup::"
+          echo "::group::cargueiro stamp"
+          cargueiro stamp --family neuvector "${dirs[@]}" --version "$VERSION"
+          echo "::endgroup::"
+          echo "::group::cargueiro check chart"
+          cargueiro check chart --family neuvector "${dirs[@]}"
+          echo "::endgroup::"
+          echo "::group::cargueiro package"
+          mkdir -p "$RUNNER_TEMP/out"
+          cargueiro package --family neuvector "${dirs[@]}" --output-dir "$RUNNER_TEMP/out"
+          echo "::endgroup::"
+
+          echo "::group::helm lint"
+          for d in "${dirs[@]}"; do helm lint "$d"; done
+          echo "::endgroup::"
+
+          ls -l "$RUNNER_TEMP/out"
+
+      - name: Upload the charts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: neuvector-rancher-charts-${{ github.run_number }}
+          path: ${{ runner.temp }}/out/*.tgz
+          if-no-files-found: error
+
+      - name: Push the charts to ghcr.io
+        if: ${{ inputs.push-to-ghcr }}
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$ACTOR" --password-stdin
+          for tgz in "$RUNNER_TEMP"/out/*.tgz; do
+            helm push "$tgz" "oci://ghcr.io/${owner}/neuvector-charts"
+          done
+          echo "OCI_REPO=oci://ghcr.io/${owner}/neuvector-charts" >> "$GITHUB_ENV"
+
+      - name: Summary
+        run: |
+          {
+            echo "### NeuVector Rancher test charts \`${VERSION}\`"
+            echo ""
+            echo "Rancher ${RANCHER_VERSION}, Kubernetes \`${KUBE_VERSION}\`"
+            echo ""
+            for tgz in "$RUNNER_TEMP"/out/*.tgz; do echo "- $(basename "$tgz")"; done
+            echo ""
+            if [ "$PUSH_TO_GHCR" = "true" ]; then
+              echo "Pushed to \`${OCI_REPO}\`."
+            else
+              echo "Download the artifact, then install with helm (crd first, then neuvector)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
